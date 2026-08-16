@@ -80,7 +80,7 @@ export function loadConfig(): AgentConfig {
     crushDbPath: Deno.env.get("CRUSH_DB_PATH") ?? null,
     crushScanRoots: crushScanRoot.split(":").filter((root) => root.length > 0),
     crushScanDepth: intEnv("CRUSH_SCAN_DEPTH", 5),
-    stateDir: Deno.env.get("STATE_DIR") ?? join(home, ".tokenmaxxing", "agent"),
+    stateDir: Deno.env.get("STATE_DIR") ?? join(home, ".tokx", "agent"),
     windowDays: intEnv("WINDOW_DAYS", 30),
     intervalSeconds: intEnv("INTERVAL_SECONDS", 0),
     timeZone,

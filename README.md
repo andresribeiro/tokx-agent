@@ -1,8 +1,8 @@
-# TokenMaxxing usage agent
+# Tokx usage agent
 
 Reads your local Claude Code, Codex, OpenCode, and Crush session data (the same
 files the t3code cost screen reads), aggregates it into daily
-`(provider, model)` usage buckets, and uploads them to a TokenMaxxing server,
+`(provider, model)` usage buckets, and uploads them to a Tokx server,
 which prices them against the LiteLLM rate table.
 
 The scan mirrors the t3code usage pipeline:
@@ -35,14 +35,14 @@ The scan mirrors the t3code usage pipeline:
 | Env var               | Default                                                   | Description                                                             |
 | --------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `TOKEN`               | required (or `--token` flag)                              | Your personal usage ingest key from the web app                         |
-| `BACKEND_URL`         | `http://localhost:3333`                                   | Base URL of the TokenMaxxing server                                     |
+| `BACKEND_URL`         | `http://localhost:3333`                                   | Base URL of the Tokx server                                     |
 | `CLAUDE_PROJECTS_DIR` | `$HOME/.claude/projects` (falls back to `$HOME/projects`) | Claude transcript directory                                             |
 | `CODEX_SESSIONS_DIR`  | `$HOME/.codex/sessions`                                   | Codex transcript directory                                              |
 | `OPENCODE_DB_PATH`    | `$XDG_DATA_HOME/opencode/opencode.db`                     | OpenCode SQLite store                                                   |
 | `CRUSH_DB_PATH`       | (unset)                                                   | A single Crush SQLite store to read instead of discovering them         |
 | `CRUSH_SCAN_ROOT`     | `$HOME`                                                   | Colon-separated roots searched for per-project `.crush/crush.db` stores |
 | `CRUSH_SCAN_DEPTH`    | `5`                                                       | Max directory depth for the Crush store search                          |
-| `STATE_DIR`           | `$HOME/.tokenmaxxing/agent`                               | Where the scan cache lives                                           |
+| `STATE_DIR`           | `$HOME/.tokx/agent`                               | Where the scan cache lives                                           |
 | `WINDOW_DAYS`         | `30`                                                      | How many days of usage to scan and upload                               |
 | `INTERVAL_SECONDS`    | `0`                                                       | If > 0, rescan on this interval instead of exiting                      |
 | `TZ`                  | system zone                                               | IANA timezone days are bucketed in                                      |
@@ -55,31 +55,31 @@ with 401.
 ## Docker
 
 ```bash
-docker build -t tokenmaxxing-agent .
+docker build -t tokx-agent .
 
-docker run -d --name tokenmaxxing --restart always \
+docker run -d --name tokx --restart always \
   --user "$(id -u):$(id -g)" \
   --memory=1g \
   -v "$HOME:/home/deno:ro" \
-  -v "$HOME/.tokenmaxxing/agent:/state" \
+  -v "$HOME/.tokx/agent:/state" \
   -e BACKEND_URL=http://localhost:3333 \
   -e INTERVAL_SECONDS=3600 \
-  andresribeiro/tokenmaxxing \
+  andresribeiro/tokx \
   --token your-ingest-key
 ```
 
 or pass the token via env instead of the `--token` flag:
 
 ```bash
-docker run -d --name tokenmaxxing --restart always \
+docker run -d --name tokx --restart always \
   --user "$(id -u):$(id -g)" \
   --memory=1g \
   -v "$HOME:/home/deno:ro" \
-  -v "$HOME/.tokenmaxxing/agent:/state" \
+  -v "$HOME/.tokx/agent:/state" \
   -e TOKEN=your-ingest-key \
   -e BACKEND_URL=http://localhost:3333 \
   -e INTERVAL_SECONDS=3600 \
-  andresribeiro/tokenmaxxing
+  andresribeiro/tokx
 ```
 
 - `--user "$(id -u):$(id -g)"` matches the container process to your host uid so
