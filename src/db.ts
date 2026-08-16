@@ -4,6 +4,67 @@ import { join } from "node:path";
 import { totalTokens } from "./types.ts";
 import type { UsageRecord, UsageTokenTotals } from "./types.ts";
 
+export interface SqliteFingerprint {
+  readonly size: number;
+  readonly mtimeMs: number;
+}
+
+/**
+ * WAL-mode stores (Crush and OpenCode) write most changes to the -wal and -shm
+ * companion files; the main .db file only changes at checkpoint time. The scan
+ * cache keys on (size, mtime), so it must cover the companions too, or it will
+ * keep serving stale records that miss recently written sessions.
+ */
+export function sqliteFingerprint(dbPath: string): SqliteFingerprint | null {
+  let main;
+  try {
+    main = Deno.statSync(dbPath);
+  } catch {
+    return null;
+  }
+  let size = main.size;
+  let mtimeMs = main.mtime instanceof Date ? main.mtime.getTime() : 0;
+  for (const suffix of ["-wal", "-shm"]) {
+    let companion;
+    try {
+      companion = Deno.statSync(`${dbPath}${suffix}`);
+    } catch {
+      continue;
+    }
+    size += companion.size;
+    const companionMtime = companion.mtime instanceof Date
+      ? companion.mtime.getTime()
+      : 0;
+    if (companionMtime > mtimeMs) mtimeMs = companionMtime;
+  }
+  return { size, mtimeMs };
+}
+
+/**
+ * Retry a SQLite read a few times with a short backoff: Crush and OpenCode
+ * keep their stores open in WAL mode, and a read that races a checkpoint or a
+ * long-running write can transiently hit a lock. Without a retry the whole
+ * store is silently missing from that run's report.
+ */
+function withSqliteRetry<T>(read: () => T): T | null {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return read();
+    } catch {
+      if (attempt < 2) {
+        // Synchronous sleep via Atomics.wait (works in Deno and Node).
+        Atomics.wait(
+          new Int32Array(new SharedArrayBuffer(4)),
+          0,
+          0,
+          100 * (attempt + 1),
+        );
+      }
+    }
+  }
+  return null;
+}
+
 const SKIPPED_DIRS = new Set([
   "node_modules",
   ".git",
@@ -104,102 +165,96 @@ export function readOpencodeRecords(
   dbPath: string,
   sinceMs: number,
 ): readonly UsageRecord[] | null {
-  let db: DatabaseSync;
-  try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
-  } catch {
-    return null;
-  }
+  return withSqliteRetry(() => {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const records: UsageRecord[] = [];
+      const coveredSessions = new Set<string>();
 
-  try {
-    const records: UsageRecord[] = [];
-    const coveredSessions = new Set<string>();
-
-    const readMessageTable = (table: "message" | "session_message"): void => {
-      const rows = db.prepare(
-        `SELECT id, session_id, time_created, data
+      const readMessageTable = (table: "message" | "session_message"): void => {
+        const rows = db.prepare(
+          `SELECT id, session_id, time_created, data
          FROM ${table}
          WHERE time_created >= ? AND data LIKE '%"tokens"%'
          ORDER BY time_created`,
-      ).all(sinceMs) as Array<{
-        id: string;
-        session_id: string;
-        time_created: number;
-        data: string;
-      }>;
-      for (const row of rows) {
-        const message = parseOpencodeMessage(
-          row.data,
-          row.id,
-          row.session_id,
-          row.time_created,
-        );
-        if (message === null) continue;
-        coveredSessions.add(row.session_id);
-        records.push(message);
-      }
-    };
+        ).all(sinceMs) as Array<{
+          id: string;
+          session_id: string;
+          time_created: number;
+          data: string;
+        }>;
+        for (const row of rows) {
+          const message = parseOpencodeMessage(
+            row.data,
+            row.id,
+            row.session_id,
+            row.time_created,
+          );
+          if (message === null) continue;
+          coveredSessions.add(row.session_id);
+          records.push(message);
+        }
+      };
 
-    if (hasTable(db, "message")) readMessageTable("message");
-    if (hasTable(db, "session_message")) readMessageTable("session_message");
+      if (hasTable(db, "message")) readMessageTable("message");
+      if (hasTable(db, "session_message")) readMessageTable("session_message");
 
-    // Session-level fallback for sessions with no message-level usage rows.
-    const readSessionTable = (table: "session" | "session_v2"): void => {
-      // Older OpenCode schemas predate the time_archived column; skip the
-      // archived filter for them so the whole read does not fail.
-      const archivedFilter = hasColumn(db, table, "time_archived")
-        ? "AND time_archived IS NULL"
-        : "";
-      const rows = db.prepare(
-        `SELECT id, model, cost, tokens_input, tokens_output,
+      // Session-level fallback for sessions with no message-level usage rows.
+      const readSessionTable = (table: "session" | "session_v2"): void => {
+        // Older OpenCode schemas predate the time_archived column; skip the
+        // archived filter for them so the whole read does not fail.
+        const archivedFilter = hasColumn(db, table, "time_archived")
+          ? "AND time_archived IS NULL"
+          : "";
+        const rows = db.prepare(
+          `SELECT id, model, cost, tokens_input, tokens_output,
                 tokens_reasoning, tokens_cache_read, tokens_cache_write,
                 time_updated
          FROM ${table}
          WHERE time_updated >= ? ${archivedFilter}
          ORDER BY time_updated`,
-      ).all(sinceMs) as Array<{
-        id: string;
-        model: string;
-        cost: number;
-        tokens_input: number;
-        tokens_output: number;
-        tokens_reasoning: number;
-        tokens_cache_read: number;
-        tokens_cache_write: number;
-        time_updated: number;
-      }>;
-      for (const row of rows) {
-        if (coveredSessions.has(row.id)) continue;
-        coveredSessions.add(row.id);
-        const totals: UsageTokenTotals = {
-          uncachedInputTokens: int(row.tokens_input),
-          cachedInputTokens: int(row.tokens_cache_read),
-          cacheCreationTokens: int(row.tokens_cache_write),
-          outputTokens: int(row.tokens_output),
-          reasoningTokens: int(row.tokens_reasoning),
-        };
-        if (totalTokens(totals) === 0) continue;
-        records.push({
-          provider: "opencode",
-          timestampMs: row.time_updated,
-          model: parseOpencodeModel(row.model),
-          sessionId: row.id,
-          totals,
-          reportedCostUsd: optionalCost(row.cost),
-          dedupeKey: `session:${row.id}`,
-        });
-      }
-    };
+        ).all(sinceMs) as Array<{
+          id: string;
+          model: string;
+          cost: number;
+          tokens_input: number;
+          tokens_output: number;
+          tokens_reasoning: number;
+          tokens_cache_read: number;
+          tokens_cache_write: number;
+          time_updated: number;
+        }>;
+        for (const row of rows) {
+          if (coveredSessions.has(row.id)) continue;
+          coveredSessions.add(row.id);
+          const totals: UsageTokenTotals = {
+            uncachedInputTokens: int(row.tokens_input),
+            cachedInputTokens: int(row.tokens_cache_read),
+            cacheCreationTokens: int(row.tokens_cache_write),
+            outputTokens: int(row.tokens_output),
+            reasoningTokens: int(row.tokens_reasoning),
+          };
+          if (totalTokens(totals) === 0) continue;
+          records.push({
+            provider: "opencode",
+            timestampMs: row.time_updated,
+            model: parseOpencodeModel(row.model),
+            sessionId: row.id,
+            totals,
+            reportedCostUsd: optionalCost(row.cost),
+            dedupeKey: `session:${row.id}`,
+          });
+        }
+      };
 
-    if (hasTable(db, "session_v2")) readSessionTable("session_v2");
-    if (hasTable(db, "session")) readSessionTable("session");
+      if (hasTable(db, "session_v2")) readSessionTable("session_v2");
+      if (hasTable(db, "session")) readSessionTable("session");
 
-    return records;
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
+      return records;
+    } finally {
+      db.close();
+    }
+  });
 }
 
 function parseOpencodeMessage(
@@ -283,54 +338,48 @@ export function readCrushRecords(
   dbPath: string,
   sinceMs: number,
 ): readonly UsageRecord[] | null {
-  let db: DatabaseSync;
-  try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
-  } catch {
-    return null;
-  }
-
-  try {
-    const sinceSeconds = Math.floor(sinceMs / 1000);
-    const hasMessages = hasTable(db, "messages");
-    const modelSubquery = hasMessages
-      ? `(SELECT m.model FROM messages m
+  return withSqliteRetry(() => {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const sinceSeconds = Math.floor(sinceMs / 1000);
+      const hasMessages = hasTable(db, "messages");
+      const modelSubquery = hasMessages
+        ? `(SELECT m.model FROM messages m
          WHERE m.session_id = s.id AND m.model != ''
          ORDER BY m.created_at DESC LIMIT 1)`
-      : `NULL`;
-    const rows = db.prepare(
-      `SELECT s.id, s.prompt_tokens, s.completion_tokens, s.cost, s.updated_at,
+        : `NULL`;
+      const rows = db.prepare(
+        `SELECT s.id, s.prompt_tokens, s.completion_tokens, s.cost, s.updated_at,
               ${modelSubquery} AS model
        FROM sessions s
        WHERE s.updated_at >= ? AND s.prompt_tokens > 0
        ORDER BY s.updated_at`,
-    ).all(sinceSeconds) as Array<{
-      id: string;
-      prompt_tokens: number;
-      completion_tokens: number;
-      cost: number;
-      updated_at: number;
-      model: string | null;
-    }>;
+      ).all(sinceSeconds) as Array<{
+        id: string;
+        prompt_tokens: number;
+        completion_tokens: number;
+        cost: number;
+        updated_at: number;
+        model: string | null;
+      }>;
 
-    return rows.map((row) => ({
-      provider: "crush",
-      timestampMs: row.updated_at * 1000,
-      model: typeof row.model === "string" ? row.model : "",
-      sessionId: row.id,
-      totals: {
-        uncachedInputTokens: int(row.prompt_tokens),
-        cachedInputTokens: 0,
-        cacheCreationTokens: 0,
-        outputTokens: int(row.completion_tokens),
-        reasoningTokens: 0,
-      },
-      reportedCostUsd: optionalCost(row.cost),
-      dedupeKey: `session:${row.id}`,
-    }));
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
+      return rows.map((row) => ({
+        provider: "crush",
+        timestampMs: row.updated_at * 1000,
+        model: typeof row.model === "string" ? row.model : "",
+        sessionId: row.id,
+        totals: {
+          uncachedInputTokens: int(row.prompt_tokens),
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+          outputTokens: int(row.completion_tokens),
+          reasoningTokens: 0,
+        },
+        reportedCostUsd: optionalCost(row.cost),
+        dedupeKey: `session:${row.id}`,
+      }));
+    } finally {
+      db.close();
+    }
+  });
 }

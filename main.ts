@@ -7,6 +7,7 @@ import {
   findCrushDatabases,
   readCrushRecords,
   readOpencodeRecords,
+  sqliteFingerprint,
 } from "./src/db.ts";
 import {
   decodeScanCache,
@@ -102,7 +103,7 @@ interface ProviderDb {
   readonly path: string;
 }
 
-async function recordsForSource(
+export async function recordsForSource(
   path: string,
   provider: UsageProviderKind,
   size: number,
@@ -124,7 +125,19 @@ async function recordsForSource(
     : provider === "crush"
     ? readCrushRecords(path, windowStartMs)
     : await readTranscriptRecords(path, provider);
-  if (parsed === null) return null;
+  if (parsed === null) {
+    // A transiently unreadable store (e.g. locked mid-checkpoint) must not
+    // zero out a provider's whole window on the server, which replaces rows
+    // on every upload. Keep the last good snapshot so the report stays
+    // complete even when a single store cannot be read.
+    if (cached !== undefined && cached.provider === provider) {
+      console.warn(
+        `re-reading ${path} failed; reusing ${cached.records.length} cached records`,
+      );
+      return cached.records;
+    }
+    return null;
+  }
   const records = dedupeWithinFile(parsed);
   cache.set(path, { size, mtimeMs, provider, records });
   return records;
@@ -211,21 +224,19 @@ async function runOnce(config: ReturnType<typeof loadConfig>): Promise<number> {
   }
 
   for (const { provider, path } of dbs) {
-    let stats;
-    try {
-      stats = await Deno.stat(path);
-    } catch {
-      continue;
-    }
-    if (stats.size === 0) continue;
+    // WAL-mode stores only touch the main .db at checkpoint time, so the
+    // fingerprint must cover the -wal/-shm companions or recent sessions are
+    // missed entirely.
+    const fingerprint = sqliteFingerprint(path);
+    if (fingerprint === null || fingerprint.size === 0) continue;
     livePaths.add(path);
     walkedRoots.push(path);
     consume(
       await recordsForSource(
         path,
         provider,
-        stats.size,
-        stats.mtime?.getTime() ?? 0,
+        fingerprint.size,
+        fingerprint.mtimeMs,
         cache,
         windowStartMs,
       ),
@@ -295,7 +306,9 @@ async function runOnce(config: ReturnType<typeof loadConfig>): Promise<number> {
   if (upload.status >= 200 && upload.status < 300) {
     console.log(`${logStamp()} upload ok (${upload.status})`);
   } else {
-    console.error(`${logStamp()} upload failed (${upload.status}): ${upload.body}`);
+    console.error(
+      `${logStamp()} upload failed (${upload.status}): ${upload.body}`,
+    );
     return 1;
   }
   return 0;

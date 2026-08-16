@@ -4,6 +4,7 @@ import {
   findCrushDatabases,
   readCrushRecords,
   readOpencodeRecords,
+  sqliteFingerprint,
 } from "../src/db.ts";
 import {
   initialCodexScanState,
@@ -11,6 +12,7 @@ import {
   parseCodexLine,
 } from "../src/transcripts.ts";
 import { dedupeWithinFile } from "../src/scan.ts";
+import { recordsForSource } from "../main.ts";
 import type { UsageRecord } from "../src/types.ts";
 import { DatabaseSync } from "node:sqlite";
 
@@ -654,5 +656,77 @@ Deno.test("crush - discovers per-project databases under scan roots", () => {
     assertEquals(shallow.length, 2);
   } finally {
     Deno.removeSync(root, { recursive: true });
+  }
+});
+
+Deno.test("sqliteFingerprint - covers the -wal and -shm companion files", () => {
+  const path = withTempDb((db) => db.exec("CREATE TABLE t (x INTEGER)"));
+  try {
+    const before = sqliteFingerprint(path);
+    assert(before !== null);
+    // WAL and SHM files may already exist; writing to one must move the
+    // fingerprint so the scan cache does not serve stale records.
+    Deno.writeFileSync(path + "-wal", new Uint8Array(64), { append: true });
+    const after = sqliteFingerprint(path);
+    assert(after !== null);
+    assertEquals(after.size, before.size + 64);
+    assert(
+      after.mtimeMs >= before.mtimeMs,
+      "fingerprint mtime should not go backwards",
+    );
+  } finally {
+    Deno.removeSync(path);
+    try {
+      Deno.removeSync(path + "-wal");
+    } catch {
+      // Already gone.
+    }
+  }
+});
+
+Deno.test("recordsForSource - a failed re-read reuses the last good snapshot", async () => {
+  const path = withTempDb((db) => {
+    db.exec(
+      `CREATE TABLE sessions (id TEXT PRIMARY KEY, prompt_tokens INTEGER,
+         completion_tokens INTEGER, cost REAL, updated_at INTEGER)`,
+    );
+    db.prepare(
+      "INSERT INTO sessions (id, prompt_tokens, completion_tokens, cost, updated_at) VALUES (?,?,?,?,?)",
+    ).run("s-1", 1000, 200, 0.05, 1786373253);
+  });
+  try {
+    const cache = new Map();
+    const stats = Deno.statSync(path);
+    const first = await recordsForSource(
+      path,
+      "crush",
+      stats.size,
+      stats.mtime!.getTime(),
+      cache,
+      0,
+    );
+    assert(first !== null);
+    assertEquals(first.length, 1);
+
+    // Drop the database: the next read fails, but the report must still carry
+    // the previous snapshot instead of silently losing the whole store.
+    Deno.removeSync(path);
+    const second = await recordsForSource(
+      path,
+      "crush",
+      999,
+      999,
+      cache,
+      0,
+    );
+    assert(second !== null);
+    assertEquals(second.length, 1);
+    assertEquals(second[0].sessionId, "s-1");
+  } finally {
+    try {
+      Deno.removeSync(path);
+    } catch {
+      // Already gone.
+    }
   }
 });
