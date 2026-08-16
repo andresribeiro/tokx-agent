@@ -114,3 +114,11 @@ deno task run -- --token your-ingest-key   # or TOKEN=... deno task run
 ```bash
 deno test
 ```
+
+## Origin
+
+This repository is a public mirror of the `agent/` directory in the private
+[tokx monorepo](https://github.com/andresribeiro/tokx). It is published so the
+agent can be pulled as a container image and inspected; development happens in
+the monorepo and changes are synced out periodically.
+
