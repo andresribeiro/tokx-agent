@@ -330,9 +330,54 @@ function parseOpencodeModel(modelJson: string): string {
 }
 
 /**
+ * Split a total across proportional counts using the largest-remainder method,
+ * so the parts always sum back exactly to the total.
+ */
+function splitInteger(total: number, counts: readonly number[]): number[] {
+  const sum = counts.reduce((a, b) => a + b, 0);
+  if (total <= 0 || sum <= 0) return counts.map(() => 0);
+  const exact = counts.map((n) => (total * n) / sum);
+  const parts = exact.map((value) => Math.floor(value));
+  const order = exact
+    .map((value, index) => ({ index, fraction: value - parts[index] }))
+    .sort((a, b) => b.fraction - a.fraction);
+  const remainder = total - parts.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < remainder; i += 1) {
+    parts[order[i % order.length].index] += 1;
+  }
+  return parts;
+}
+
+/**
+ * Split a decimal cost proportionally, rounding to the storage precision the
+ * server uses for costs (6 decimals) and absorbing the rounding drift into the
+ * largest part so the parts still sum back to the same cost.
+ */
+function splitDecimal(
+  total: number | null,
+  counts: readonly number[],
+): Array<number | null> {
+  if (total === null) return counts.map(() => null);
+  if (!Number.isFinite(total)) return counts.map(() => 0);
+  const sum = counts.reduce((a, b) => a + b, 0);
+  if (sum <= 0) return counts.map(() => 0);
+  const parts = counts.map((n) => Math.round((total * n) / sum * 1e6) / 1e6);
+  const drift = total - parts.reduce((a, b) => a + b, 0);
+  const largest = parts.indexOf(Math.max(...parts));
+  if (largest !== -1) {
+    parts[largest] = Math.max(0, parts[largest] + drift);
+  }
+  return parts;
+}
+
+/**
  * Read session-level usage from Crush's SQLite store. Sessions only track
- * aggregate prompt/completion tokens and a provider-reported cost; the model is
- * taken from the session's most recent assistant message, if any.
+ * aggregate prompt/completion tokens and a provider-reported cost; the model
+ * is taken from the session's assistant messages. A session that switches
+ * models cannot be split exactly (the store never records per-message usage),
+ * so its totals are distributed across the models it actually used,
+ * proportional to how many assistant messages each produced. Sessions whose
+ * messages carry no model keep their totals under an empty model name.
  */
 export function readCrushRecords(
   dbPath: string,
@@ -342,15 +387,8 @@ export function readCrushRecords(
     const db = new DatabaseSync(dbPath, { readOnly: true });
     try {
       const sinceSeconds = Math.floor(sinceMs / 1000);
-      const hasMessages = hasTable(db, "messages");
-      const modelSubquery = hasMessages
-        ? `(SELECT m.model FROM messages m
-         WHERE m.session_id = s.id AND m.model != ''
-         ORDER BY m.created_at DESC LIMIT 1)`
-        : `NULL`;
       const rows = db.prepare(
-        `SELECT s.id, s.prompt_tokens, s.completion_tokens, s.cost, s.updated_at,
-              ${modelSubquery} AS model
+        `SELECT s.id, s.prompt_tokens, s.completion_tokens, s.cost, s.updated_at
        FROM sessions s
        WHERE s.updated_at >= ? AND s.prompt_tokens > 0
        ORDER BY s.updated_at`,
@@ -360,24 +398,71 @@ export function readCrushRecords(
         completion_tokens: number;
         cost: number;
         updated_at: number;
-        model: string | null;
       }>;
 
-      return rows.map((row) => ({
-        provider: "crush",
-        timestampMs: row.updated_at * 1000,
-        model: typeof row.model === "string" ? row.model : "",
-        sessionId: row.id,
-        totals: {
-          uncachedInputTokens: int(row.prompt_tokens),
-          cachedInputTokens: 0,
-          cacheCreationTokens: 0,
-          outputTokens: int(row.completion_tokens),
-          reasoningTokens: 0,
-        },
-        reportedCostUsd: optionalCost(row.cost),
-        dedupeKey: `session:${row.id}`,
-      }));
+      const modelCounts = new Map<string, Array<{ model: string; n: number }>>();
+      if (hasTable(db, "messages") && hasColumn(db, "messages", "model")) {
+        const distribution = db.prepare(
+          `SELECT session_id, model, COUNT(*) AS n
+         FROM messages
+         WHERE model != ''
+         GROUP BY session_id, model`,
+        ).all() as Array<{ session_id: string; model: string; n: number }>;
+        for (const row of distribution) {
+          const entry = modelCounts.get(row.session_id) ?? [];
+          entry.push({ model: row.model, n: row.n });
+          modelCounts.set(row.session_id, entry);
+        }
+      }
+
+      const records: UsageRecord[] = [];
+      for (const row of rows) {
+        const models = modelCounts.get(row.id) ?? [];
+        const timestampMs = row.updated_at * 1000;
+        const sessionId = row.id;
+        if (models.length <= 1) {
+          records.push({
+            provider: "crush",
+            timestampMs,
+            model: models[0]?.model ?? "",
+            sessionId,
+            totals: {
+              uncachedInputTokens: int(row.prompt_tokens),
+              cachedInputTokens: 0,
+              cacheCreationTokens: 0,
+              outputTokens: int(row.completion_tokens),
+              reasoningTokens: 0,
+            },
+            reportedCostUsd: optionalCost(row.cost),
+            dedupeKey: `session:${sessionId}`,
+          });
+          continue;
+        }
+
+        const counts = models.map((entry) => entry.n);
+        const inputShares = splitInteger(int(row.prompt_tokens), counts);
+        const outputShares = splitInteger(int(row.completion_tokens), counts);
+        const costShares = splitDecimal(row.cost, counts);
+        for (let i = 0; i < models.length; i += 1) {
+          records.push({
+            provider: "crush",
+            timestampMs,
+            model: models[i].model,
+            sessionId,
+            totals: {
+              uncachedInputTokens: inputShares[i],
+              cachedInputTokens: 0,
+              cacheCreationTokens: 0,
+              outputTokens: outputShares[i],
+              reasoningTokens: 0,
+            },
+            reportedCostUsd: costShares[i],
+            dedupeKey: `session:${sessionId}:${models[i].model}`,
+          });
+        }
+      }
+
+      return records;
     } finally {
       db.close();
     }

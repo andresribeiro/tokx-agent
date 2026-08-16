@@ -20,8 +20,10 @@ The scan mirrors the t3code usage pipeline:
 - Crush: one SQLite store per project (a `.crush/crush.db` in each working
   directory, falling back to `~/.crush`); the agent discovers them under your
   home directory (or `CRUSH_SCAN_ROOT`). Sessions only track aggregate
-  prompt/completion tokens plus a provider-reported cost; the model is taken
-  from the session's most recent assistant message, if any.
+  prompt/completion tokens plus a provider-reported cost; the model comes from
+  the session's assistant messages. A session that switches models is split
+  across the models it used, proportional to assistant message counts, since
+  the store never records per-message usage.
 - Cost: the agent never prices usage itself. Buckets whose records carry a
   provider-reported cost send that sum (`cost_usd`); everything else sends
   `cost_usd: null` and is priced by the server against the LiteLLM rate table.

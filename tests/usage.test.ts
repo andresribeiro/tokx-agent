@@ -628,6 +628,62 @@ Deno.test("crush - reads session totals with the last assistant model", () => {
   }
 });
 
+Deno.test("crush - splits a mixed-model session across the models used", () => {
+  const path = withTempDb((db) => {
+    db.exec(
+      `CREATE TABLE sessions (id TEXT PRIMARY KEY, prompt_tokens INTEGER,
+         completion_tokens INTEGER, cost REAL, updated_at INTEGER);
+       CREATE TABLE messages (session_id TEXT, model TEXT, created_at INTEGER)`,
+    );
+    db.prepare(
+      "INSERT INTO sessions (id, prompt_tokens, completion_tokens, cost, updated_at) VALUES (?,?,?,?,?)",
+    ).run("s-mix", 1000, 200, 0.1, 1786373253);
+    for (let i = 0; i < 3; i += 1) {
+      db.prepare(
+        "INSERT INTO messages (session_id, model, created_at) VALUES (?,?,?)",
+      ).run("s-mix", "openai/gpt-5.6-luna", 1786373250 + i);
+    }
+    db.prepare(
+      "INSERT INTO messages (session_id, model, created_at) VALUES (?,?,?)",
+    ).run("s-mix", "deepseek-v4-flash", 1786373252);
+  });
+  try {
+    const records = readCrushRecords(path, 0);
+    assert(records !== null);
+    assertEquals(records.length, 2);
+    const byModel = Object.fromEntries(
+      records.map((r) => [r.model, r]),
+    );
+    const luna = byModel["openai/gpt-5.6-luna"];
+    const deepseek = byModel["deepseek-v4-flash"];
+    assert(luna !== undefined && deepseek !== undefined);
+    // 3 of 4 assistant messages are luna, 1 is deepseek.
+    assertEquals(luna.totals, {
+      uncachedInputTokens: 750,
+      cachedInputTokens: 0,
+      cacheCreationTokens: 0,
+      outputTokens: 150,
+      reasoningTokens: 0,
+    });
+    assertEquals(deepseek.totals, {
+      uncachedInputTokens: 250,
+      cachedInputTokens: 0,
+      cacheCreationTokens: 0,
+      outputTokens: 50,
+      reasoningTokens: 0,
+    });
+    assertEquals(luna.reportedCostUsd, 0.075);
+    assertEquals(deepseek.reportedCostUsd, 0.025);
+    // The split keeps both parts in one session and must not collide.
+    assertEquals(luna.sessionId, "s-mix");
+    assertEquals(deepseek.sessionId, "s-mix");
+    assertEquals(luna.dedupeKey, "session:s-mix:openai/gpt-5.6-luna");
+    assertEquals(deepseek.dedupeKey, "session:s-mix:deepseek-v4-flash");
+  } finally {
+    Deno.removeSync(path);
+  }
+});
+
 Deno.test("crush - discovers per-project databases under scan roots", () => {
   const root = Deno.makeTempDirSync();
   try {

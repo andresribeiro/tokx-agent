@@ -11,7 +11,9 @@ import {
 } from "./transcripts.ts";
 import type { UsageProviderKind, UsageRecord } from "./types.ts";
 
-const SCAN_CACHE_VERSION = 2;
+// v3: Crush sessions that used several models now split their totals across
+// those models instead of attributing everything to the last one.
+const SCAN_CACHE_VERSION = 3;
 
 export interface TranscriptFile {
   readonly path: string;
