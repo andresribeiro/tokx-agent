@@ -1,0 +1,18 @@
+{
+  "name": "@tokenmaxxing/usage-agent",
+  "version": "0.1.0",
+  "exports": "./main.ts",
+  "tasks": {
+    "run": "deno run --allow-env --allow-read --allow-write --allow-net --allow-sys main.ts",
+    "check": "deno check main.ts",
+    "lint": "deno lint",
+    "test": "deno test --allow-env --allow-read --allow-write --allow-net --allow-sys"
+  },
+  "lint": {
+    "exclude": []
+  },
+  "fmt": {
+    "exclude": []
+  },
+  "imports": {}
+}
