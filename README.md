@@ -64,7 +64,7 @@ docker run -d --name tokx --restart always \
   -v "$HOME/.tokx/agent:/state" \
   -e BACKEND_URL=http://localhost:3333 \
   -e INTERVAL_SECONDS=3600 \
-  andresribeiro/tokx \
+  ghcr.io/andresribeiro/tokx-agent:latest \
   --token your-ingest-key
 ```
 
@@ -79,7 +79,7 @@ docker run -d --name tokx --restart always \
   -e TOKEN=your-ingest-key \
   -e BACKEND_URL=http://localhost:3333 \
   -e INTERVAL_SECONDS=3600 \
-  andresribeiro/tokx
+  ghcr.io/andresribeiro/tokx-agent:latest
 ```
 
 - `--user "$(id -u):$(id -g)"` matches the container process to your host uid so
