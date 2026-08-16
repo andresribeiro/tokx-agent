@@ -40,6 +40,10 @@ function addDays(
   return formatter(base + offset * DAY_MS);
 }
 
+function logStamp(): string {
+  return new Date().toISOString();
+}
+
 function toWireBucket(bucket: UsageBucket): WireBucket {
   const toTotals = (totals: UsageBucket["totals"]) => ({
     uncached_input_tokens: totals.uncachedInputTokens,
@@ -281,17 +285,17 @@ async function runOnce(config: ReturnType<typeof loadConfig>): Promise<number> {
   try {
     upload = await uploadReport(config.backendUrl, config.token, report);
   } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
     console.error(
-      `upload failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `${logStamp()} upload failed: could not reach the backend at ${config.backendUrl} (${detail}). ` +
+        "Check that the server is running and the URL is correct, then run again.",
     );
     return 1;
   }
   if (upload.status >= 200 && upload.status < 300) {
-    console.log(`upload ok (${upload.status})`);
+    console.log(`${logStamp()} upload ok (${upload.status})`);
   } else {
-    console.error(`upload failed (${upload.status}): ${upload.body}`);
+    console.error(`${logStamp()} upload failed (${upload.status}): ${upload.body}`);
     return 1;
   }
   return 0;
